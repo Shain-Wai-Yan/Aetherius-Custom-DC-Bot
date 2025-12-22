@@ -109,7 +109,8 @@ LEVEL_BLESSINGS = {
 }
 
 def calculate_xp_for_level(level):
-    return LEVEL_MULTIPLIER * (level ** 2)
+    # Total XP required to REACH this level
+    return LEVEL_MULTIPLIER * (level - 1) ** 2
 
 def get_user_level(xp):
     level = 1
@@ -223,76 +224,91 @@ async def on_message(message):
 @bot.command(name='claim')
 async def claim_crystal(ctx):
     global crystal_active, crystal_message_id
-    
+
     if not crystal_active:
         return
-    
+
+    if ctx.message.reference is None or ctx.message.reference.message_id != crystal_message_id:
+        await ctx.reply("⚠️ Reply to the Crystal message to claim it!", delete_after=5)
+        return
+
     crystal_active = False
-    
+
     conn = sqlite3.connect('arcadia.db')
     c = conn.cursor()
-    
-    c.execute('SELECT * FROM users WHERE user_id = ?', (ctx.author.id,))
-    user_data = c.fetchone()
-    
-    if user_data:
-        new_xp = user_data[2] + 100
-        new_shards = user_data[6] + 1
-        c.execute('UPDATE users SET xp = ?, crystal_shards = ? WHERE user_id = ?',
-                  (new_xp, new_shards, ctx.author.id))
+
+    c.execute('SELECT xp, crystal_shards FROM users WHERE user_id = ?', (ctx.author.id,))
+    row = c.fetchone()
+
+    if row:
+        xp, shards = row
+        c.execute(
+            'UPDATE users SET xp = ?, crystal_shards = ? WHERE user_id = ?',
+            (xp + 100, shards + 1, ctx.author.id)
+        )
     else:
-        c.execute('''INSERT INTO users (user_id, username, xp, level, last_message, total_messages, crystal_shards)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)''',
-                  (ctx.author.id, str(ctx.author), 100, 1, datetime.now().timestamp(), 0, 1))
-    
+        c.execute(
+            '''INSERT INTO users
+               (user_id, username, xp, level, last_message, total_messages,
+                crystal_shards, blessings_given, blessings_received)
+               VALUES (?, ?, 100, 1, ?, 0, 1, 0, 0)''',
+            (ctx.author.id, str(ctx.author), datetime.now().timestamp())
+        )
+
     conn.commit()
     conn.close()
-    
+
     embed = discord.Embed(
         title="💎 CRYSTAL SHARD CLAIMED!",
         description=f"{ctx.author.mention} has claimed the Crystal Shard!\n\n**+100 XP** ⚡\n**+1 Crystal Shard** 💎",
         color=0x00FF00
     )
-    embed.set_thumbnail(url=ctx.author.avatar.url if ctx.author.avatar else ctx.author.default_avatar.url)
-    
+    embed.set_thumbnail(url=ctx.author.display_avatar.url)
     await ctx.send(embed=embed)
+
 
 async def process_xp(message):
     if message.author.bot or not message.guild:
         return
-    
+
     conn = sqlite3.connect('arcadia.db')
     c = conn.cursor()
-    
+
     user_id = message.author.id
     current_time = datetime.now().timestamp()
-    
-    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    user_data = c.fetchone()
-    
-    if user_data:
-        last_message = user_data[4]
-        if current_time - last_message < XP_COOLDOWN:
+
+    c.execute('SELECT xp, level, last_message, total_messages FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+
+    if row:
+        xp, level, last_message, total_messages = row
+
+        if last_message and current_time - last_message < XP_COOLDOWN:
             conn.close()
             return
-        
-        old_xp = user_data[2]
-        old_level = user_data[3]
-        new_xp = old_xp + XP_PER_MESSAGE
+
+        new_xp = xp + XP_PER_MESSAGE
         new_level = get_user_level(new_xp)
-        total_messages = user_data[5] + 1
-        
-        c.execute('''UPDATE users SET xp = ?, level = ?, last_message = ?, 
-                     username = ?, total_messages = ? WHERE user_id = ?''',
-                  (new_xp, new_level, current_time, str(message.author), total_messages, user_id))
-        
-        if new_level > old_level:
+
+        c.execute(
+            '''UPDATE users
+               SET xp = ?, level = ?, last_message = ?, total_messages = ?, username = ?
+               WHERE user_id = ?''',
+            (new_xp, new_level, current_time, total_messages + 1, str(message.author), user_id)
+        )
+
+        if new_level > level:
             await handle_level_up(message, new_level)
+
     else:
-        c.execute('''INSERT INTO users (user_id, username, xp, level, last_message, total_messages, crystal_shards, blessings_given, blessings_received)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (user_id, str(message.author), XP_PER_MESSAGE, 1, current_time, 1, 0, 0, 0))
-    
+        c.execute(
+            '''INSERT INTO users
+               (user_id, username, xp, level, last_message, total_messages,
+                crystal_shards, blessings_given, blessings_received)
+               VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)''',
+            (user_id, str(message.author), XP_PER_MESSAGE, 1, current_time, 1)
+        )
+
     conn.commit()
     conn.close()
 
@@ -385,9 +401,12 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
     await interaction.response.send_message(embed=embed)
 
 def create_progress_bar(current, total, length=10):
+    if total <= 0:
+        return "[██████████]"
     filled = int((current / total) * length)
-    bar = "█" * filled + "░" * (length - filled)
-    return f"[{bar}]"
+    filled = min(filled, length)
+    return "[" + "█" * filled + "░" * (length - filled) + "]"
+
 
 @bot.tree.command(name="bless", description="Bestow a Guardian's Blessing upon another member")
 async def bless(interaction: discord.Interaction, member: discord.Member):
