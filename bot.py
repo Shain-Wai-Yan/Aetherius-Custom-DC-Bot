@@ -5,8 +5,31 @@ import sqlite3
 import asyncio
 from datetime import datetime
 import random
+from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
 
-# Bot Configuration
+load_dotenv()
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "🛡️ Aetherius | The Eternal Sentry is awake and guarding Arcadia!"
+
+@app.route('/health')
+def health():
+    return {"status": "online", "bot": "Aetherius"}
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -14,12 +37,10 @@ intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Database Setup
 def init_db():
     conn = sqlite3.connect('arcadia.db')
     c = conn.cursor()
     
-    # Users table for XP and levels
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (user_id INTEGER PRIMARY KEY,
                   username TEXT,
@@ -49,7 +70,6 @@ def init_db():
         c.execute('ALTER TABLE users ADD COLUMN blessings_received INTEGER DEFAULT 0')
         print("✅ Added blessings_received column to existing database")
     
-    # Daily prophecies tracking
     c.execute('''CREATE TABLE IF NOT EXISTS prophecies
                  (date TEXT PRIMARY KEY,
                   prophecy TEXT,
@@ -58,7 +78,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# XP Configuration
 XP_PER_MESSAGE = 15
 XP_COOLDOWN = 60  # seconds between XP gains
 LEVEL_MULTIPLIER = 100
@@ -68,7 +87,6 @@ message_counter = 0
 crystal_active = False
 crystal_message_id = None
 
-# Role rewards based on your server hierarchy
 ROLE_REWARDS = {
     5: "Hoplite",
     10: "Captain",
@@ -99,15 +117,17 @@ def get_user_level(xp):
         level += 1
     return level
 
-# Bot Events
 @bot.event
 async def on_ready():
     print(f'✨ Aetherius | The Eternal Sentry has awakened in Arcadia!')
     print(f'Guardian ID: {bot.user.id}')
     init_db()
     
-    # Bot ready! Use /sync command to sync slash commands if needed.
-    print(f'⚔️ Bot ready! Use /sync command to sync slash commands if needed.')
+    try:
+        synced = await bot.tree.sync()
+        print(f"⚔️ Synced {len(synced)} slash commands successfully!")
+    except Exception as e:
+        print(f"❌ Failed to sync commands: {e}")
     
     await bot.change_presence(
         activity=discord.Activity(
@@ -118,7 +138,6 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member):
-    """Welcome new members with an epic fantasy greeting"""
     welcome_messages = [
         f"🏰 **Hark! A new soul enters the realm!**\n\nWelcome, {member.mention}, to **Guardian of Arcadia**! The floating isles shimmer with ancient magic as you step into our mystical domain. May your journey be filled with wonder and glory!",
         
@@ -139,7 +158,7 @@ async def on_member_join(member):
         embed = discord.Embed(
             title="🌟 A New Guardian Arrives",
             description=random.choice(welcome_messages),
-            color=0x00CED1  # Cyan/turquoise matching the mystical aesthetic
+            color=0x00CED1
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.set_footer(text=f"Member #{member.guild.member_count} • May the Arcane guide you")
@@ -169,7 +188,6 @@ async def on_message(message):
         crystal_msg = await message.channel.send(embed=embed)
         crystal_message_id = crystal_msg.id
         
-        # Auto-expire after 30 seconds
         await asyncio.sleep(30)
         if crystal_active:
             crystal_active = False
@@ -180,7 +198,6 @@ async def on_message(message):
             )
             await crystal_msg.edit(embed=expired_embed)
     
-    # Keyword responses for immersion
     content_lower = message.content.lower()
     
     keywords = {
@@ -199,7 +216,6 @@ async def on_message(message):
             await message.channel.send(response)
             break
     
-    # XP System
     await process_xp(message)
     
     await bot.process_commands(message)
@@ -213,7 +229,6 @@ async def claim_crystal(ctx):
     
     crystal_active = False
     
-    # Award the crystal and bonus XP
     conn = sqlite3.connect('arcadia.db')
     c = conn.cursor()
     
@@ -243,7 +258,6 @@ async def claim_crystal(ctx):
     await ctx.send(embed=embed)
 
 async def process_xp(message):
-    """Award XP for messages and handle level ups"""
     if message.author.bot or not message.guild:
         return
     
@@ -253,7 +267,6 @@ async def process_xp(message):
     user_id = message.author.id
     current_time = datetime.now().timestamp()
     
-    # Get user data
     c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
     user_data = c.fetchone()
     
@@ -273,11 +286,9 @@ async def process_xp(message):
                      username = ?, total_messages = ? WHERE user_id = ?''',
                   (new_xp, new_level, current_time, str(message.author), total_messages, user_id))
         
-        # Level up!
         if new_level > old_level:
             await handle_level_up(message, new_level)
     else:
-        # New user
         c.execute('''INSERT INTO users (user_id, username, xp, level, last_message, total_messages, crystal_shards, blessings_given, blessings_received)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (user_id, str(message.author), XP_PER_MESSAGE, 1, current_time, 1, 0, 0, 0))
@@ -286,7 +297,6 @@ async def process_xp(message):
     conn.close()
 
 async def handle_level_up(message, new_level):
-    """Handle level up announcements and role rewards"""
     blessing_emoji = "✨"
     for milestone in sorted(LEVEL_BLESSINGS.keys(), reverse=True):
         if new_level >= milestone:
@@ -296,10 +306,9 @@ async def handle_level_up(message, new_level):
     embed = discord.Embed(
         title=f"{blessing_emoji} RANK ASCENSION {blessing_emoji}",
         description=f"🎉 {message.author.mention} has ascended to **Level {new_level}**!\n\nThe Arcane energies flow stronger within you...",
-        color=0xFFD700  # Gold
+        color=0xFFD700
     )
     
-    # Check for role rewards
     if new_level in ROLE_REWARDS:
         role_name = ROLE_REWARDS[new_level]
         role = discord.utils.get(message.guild.roles, name=role_name)
@@ -320,7 +329,6 @@ async def handle_level_up(message, new_level):
     
     await message.channel.send(embed=embed)
 
-# Slash Commands
 @bot.tree.command(name="profile", description="View your Guardian profile and stats")
 async def profile(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
@@ -369,7 +377,6 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
         embed.add_field(name="🙏 Blessings Given", value=f"**{blessings_given}**", inline=True)
         embed.add_field(name="✨ Blessings Received", value=f"**{blessings_received}**", inline=True)
         
-        # Show highest role
         roles = [r for r in target.roles if r.name != "@everyone"]
         if roles:
             highest_role = max(roles, key=lambda r: r.position)
@@ -378,7 +385,6 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
     await interaction.response.send_message(embed=embed)
 
 def create_progress_bar(current, total, length=10):
-    """Create a visual progress bar"""
     filled = int((current / total) * length)
     bar = "█" * filled + "░" * (length - filled)
     return f"[{bar}]"
@@ -397,10 +403,8 @@ async def bless(interaction: discord.Interaction, member: discord.Member):
     c = conn.cursor()
     
     try:
-        # Update both users
         blessing_xp = 25
         
-        # Giver
         c.execute('SELECT * FROM users WHERE user_id = ?', (interaction.user.id,))
         giver_data = c.fetchone()
         if giver_data:
@@ -411,7 +415,6 @@ async def bless(interaction: discord.Interaction, member: discord.Member):
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                       (interaction.user.id, str(interaction.user), blessing_xp, 1, datetime.now().timestamp(), 0, 0, 1, 0))
         
-        # Receiver
         c.execute('SELECT * FROM users WHERE user_id = ?', (member.id,))
         receiver_data = c.fetchone()
         if receiver_data:
@@ -539,7 +542,6 @@ async def lore(interaction: discord.Interaction, topic: str = None):
             color=0x00CED1
         )
     else:
-        # Show list of topics
         embed = discord.Embed(
             title="📖 Arcadia's Chronicles",
             description="Choose a topic to learn more about the mysteries of our realm:",
@@ -670,7 +672,6 @@ async def db_check(interaction: discord.Interaction):
         conn = sqlite3.connect('arcadia.db')
         c = conn.cursor()
         
-        # Check users table structure
         c.execute("PRAGMA table_info(users)")
         columns = c.fetchall()
         column_names = [col[1] for col in columns]
@@ -693,11 +694,13 @@ async def db_check(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Database error: {str(e)}", ephemeral=True)
 
-# Run the bot
 if __name__ == "__main__":
     TOKEN = os.getenv('DISCORD_BOT_TOKEN')
     if not TOKEN:
         print("❌ Error: DISCORD_BOT_TOKEN not found in environment variables!")
         print("Please set your bot token in the environment or .env file")
     else:
+        print("🌐 Starting keep-alive server for Render...")
+        keep_alive()
+        print("🤖 Starting Discord bot...")
         bot.run(TOKEN)
