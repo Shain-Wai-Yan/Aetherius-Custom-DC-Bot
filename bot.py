@@ -135,12 +135,14 @@ keyword_cooldowns = defaultdict(float)
 KEYWORD_COOLDOWN = 30  # seconds between keyword responses per user
 
 ROLE_REWARDS = {
-    5: "Hoplite",
-    10: "Captain",
-    15: "Battalion Leaders",
-    20: "Colonel",
-    30: "Brigadier",
-    50: "General",
+    0: "Cloud-Walker",
+    5: "Mist-Warden",
+    10: "Aether-Guard",
+    18: "Crystal-Sentinel",
+    26: "Isle-Vanguard",
+    35: "Sky-Paladin",
+    45: "Grand Archon",
+    60: "Arcadian Paragon"
 }
 
 LEVEL_BLESSINGS = {
