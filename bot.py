@@ -1,13 +1,17 @@
 import discord
 from discord.ext import commands
 import os
-import sqlite3
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
 import asyncio
 from datetime import datetime
 import random
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
+from collections import defaultdict
+from threading import Lock
 
 load_dotenv()
 
@@ -37,55 +41,98 @@ intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+connection_pool = None
+
+def get_db_connection():
+    """Get a connection from the pool"""
+    global connection_pool
+    if connection_pool is None:
+        DATABASE_URL = os.getenv('DATABASE_URL')
+        if not DATABASE_URL:
+            raise Exception("❌ DATABASE_URL environment variable not set!")
+        
+        connection_pool = psycopg2.pool.ThreadedConnectionPool(
+            1, 10,
+            DATABASE_URL,
+            cursor_factory=RealDictCursor
+        )
+        print("✅ PostgreSQL connection pool created successfully!")
+    
+    return connection_pool.getconn()
+
+def release_db_connection(conn):
+    """Release connection back to the pool"""
+    global connection_pool
+    if connection_pool:
+        connection_pool.putconn(conn)
+
 def init_db():
-    conn = sqlite3.connect('arcadia.db')
-    c = conn.cursor()
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (user_id INTEGER PRIMARY KEY,
-                  username TEXT,
-                  xp INTEGER DEFAULT 0,
-                  level INTEGER DEFAULT 1,
-                  last_message REAL,
-                  total_messages INTEGER DEFAULT 0,
-                  crystal_shards INTEGER DEFAULT 0,
-                  blessings_given INTEGER DEFAULT 0,
-                  blessings_received INTEGER DEFAULT 0)''')
-    
+    conn = None
     try:
-        c.execute('SELECT crystal_shards FROM users LIMIT 1')
-    except sqlite3.OperationalError:
-        c.execute('ALTER TABLE users ADD COLUMN crystal_shards INTEGER DEFAULT 0')
-        print("✅ Added crystal_shards column to existing database")
-    
-    try:
-        c.execute('SELECT blessings_given FROM users LIMIT 1')
-    except sqlite3.OperationalError:
-        c.execute('ALTER TABLE users ADD COLUMN blessings_given INTEGER DEFAULT 0')
-        print("✅ Added blessings_given column to existing database")
-    
-    try:
-        c.execute('SELECT blessings_received FROM users LIMIT 1')
-    except sqlite3.OperationalError:
-        c.execute('ALTER TABLE users ADD COLUMN blessings_received INTEGER DEFAULT 0')
-        print("✅ Added blessings_received column to existing database")
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS prophecies
-                 (date TEXT PRIMARY KEY,
-                  prophecy TEXT,
-                  omen_type TEXT)''')
-    
-    conn.commit()
-    conn.close()
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+                     (user_id BIGINT PRIMARY KEY,
+                      username TEXT,
+                      xp INTEGER DEFAULT 0,
+                      level INTEGER DEFAULT 1,
+                      last_message DOUBLE PRECISION,
+                      total_messages INTEGER DEFAULT 0,
+                      crystal_shards INTEGER DEFAULT 0,
+                      blessings_given INTEGER DEFAULT 0,
+                      blessings_received INTEGER DEFAULT 0)''')
+        
+        c.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'users'
+        """)
+        existing_columns = [row['column_name'] for row in c.fetchall()]
+        
+        if 'crystal_shards' not in existing_columns:
+            c.execute('ALTER TABLE users ADD COLUMN crystal_shards INTEGER DEFAULT 0')
+            print("✅ Added crystal_shards column to existing database")
+        
+        if 'blessings_given' not in existing_columns:
+            c.execute('ALTER TABLE users ADD COLUMN blessings_given INTEGER DEFAULT 0')
+            print("✅ Added blessings_given column to existing database")
+        
+        if 'blessings_received' not in existing_columns:
+            c.execute('ALTER TABLE users ADD COLUMN blessings_received INTEGER DEFAULT 0')
+            print("✅ Added blessings_received column to existing database")
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS prophecies
+                     (date TEXT PRIMARY KEY,
+                      prophecy TEXT,
+                      omen_type TEXT)''')
+        
+        conn.commit()
+        print("✅ Database tables initialized successfully!")
+    except Exception as e:
+        print(f"❌ Database initialization error: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 XP_PER_MESSAGE = 15
 XP_COOLDOWN = 60  # seconds between XP gains
 LEVEL_MULTIPLIER = 100
 
+message_counter = defaultdict(int)
+crystals = {}  # guild_id -> {active: bool, message_id: int, channel_id: int}
+crystal_lock = Lock()
+xp_cooldowns = {}  # (guild_id, user_id) -> timestamp
+
 CRYSTAL_DROP_CHANCE = 50  # Every ~50 messages a crystal can drop
-message_counter = 0
-crystal_active = False
-crystal_message_id = None
+# crystal_active = False # REMOVED
+# crystal_message_id = None # REMOVED
+# crystal_lock = Lock() # MOVED UP
+
+keyword_cooldowns = defaultdict(float)
+KEYWORD_COOLDOWN = 30  # seconds between keyword responses per user
 
 ROLE_REWARDS = {
     5: "Hoplite",
@@ -168,36 +215,47 @@ async def on_member_join(member):
 
 @bot.event
 async def on_message(message):
-    global message_counter, crystal_active, crystal_message_id
+    global message_counter, crystals
     
     if message.author.bot:
         return
     
-    message_counter += 1
+    if not message.guild:
+        return
     
-    if message_counter >= CRYSTAL_DROP_CHANCE and not crystal_active:
-        message_counter = 0
-        crystal_active = True
+    guild_id = message.guild.id
+    message_counter[guild_id] += 1
+    
+    if message_counter[guild_id] >= CRYSTAL_DROP_CHANCE and guild_id not in crystals:
+        message_counter[guild_id] = 0
         
         embed = discord.Embed(
             title="💎 CRYSTAL SHARD DISCOVERED!",
-            description="A mystical **Crystal Shard** has appeared! Type `!claim` to collect it and gain **100 bonus XP**!",
+            description="A mystical **Crystal Shard** has appeared! Type `!claim` in this channel to collect it and gain **100 bonus XP**!",
             color=0x00FFFF
         )
-        embed.set_footer(text="First to claim wins! ⚡")
+        embed.set_footer(text="First to claim wins! ⚡ Expires in 30 seconds")
         
         crystal_msg = await message.channel.send(embed=embed)
-        crystal_message_id = crystal_msg.id
+        crystals[guild_id] = {
+            'active': True,
+            'message_id': crystal_msg.id,
+            'channel_id': message.channel.id
+        }
         
         await asyncio.sleep(30)
-        if crystal_active:
-            crystal_active = False
+        if guild_id in crystals and crystals[guild_id]['active']:
+            crystals[guild_id]['active'] = False
             expired_embed = discord.Embed(
                 title="💎 Crystal Shard Vanished",
                 description="The Crystal Shard has faded back into the Arcane mists...",
                 color=0x808080
             )
-            await crystal_msg.edit(embed=expired_embed)
+            try:
+                await crystal_msg.edit(embed=expired_embed)
+            except:
+                pass
+            del crystals[guild_id]
     
     content_lower = message.content.lower()
     
@@ -212,9 +270,14 @@ async def on_message(message):
         "thank you aetherius": "✨ The honor is mine. May your path be ever illuminated!",
     }
     
+    current_time = datetime.now().timestamp()
+    user_id = message.author.id
+    
     for keyword, response in keywords.items():
         if keyword in content_lower:
-            await message.channel.send(response)
+            if current_time - keyword_cooldowns.get(user_id, 0) >= KEYWORD_COOLDOWN:
+                await message.channel.send(response)
+                keyword_cooldowns[user_id] = current_time
             break
     
     await process_xp(message)
@@ -223,94 +286,136 @@ async def on_message(message):
 
 @bot.command(name='claim')
 async def claim_crystal(ctx):
-    global crystal_active, crystal_message_id
+    global crystals
 
-    if not crystal_active:
-        return
+    guild_id = ctx.guild.id
+    
+    with crystal_lock:
+        if guild_id not in crystals or not crystals[guild_id]['active']:
+            return
 
-    if ctx.message.reference is None or ctx.message.reference.message_id != crystal_message_id:
-        await ctx.reply("⚠️ Reply to the Crystal message to claim it!", delete_after=5)
-        return
+        if ctx.channel.id != crystals[guild_id]['channel_id']:
+            await ctx.reply("⚠️ The crystal is in a different channel!", delete_after=5)
+            return
 
-    crystal_active = False
+        crystals[guild_id]['active'] = False
 
-    conn = sqlite3.connect('arcadia.db')
-    c = conn.cursor()
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
 
-    c.execute('SELECT xp, crystal_shards FROM users WHERE user_id = ?', (ctx.author.id,))
-    row = c.fetchone()
+        c.execute('SELECT xp, level, crystal_shards FROM users WHERE user_id = %s', (ctx.author.id,))
+        row = c.fetchone()
 
-    if row:
-        xp, shards = row
-        c.execute(
-            'UPDATE users SET xp = ?, crystal_shards = ? WHERE user_id = ?',
-            (xp + 100, shards + 1, ctx.author.id)
+        if row:
+            xp, level, shards = row['xp'], row['level'], row['crystal_shards']
+            new_xp = xp + 100
+            new_level = get_user_level(new_xp)
+            c.execute(
+                'UPDATE users SET xp = %s, level = %s, crystal_shards = %s WHERE user_id = %s',
+                (new_xp, new_level, shards + 1, ctx.author.id)
+            )
+            
+            if new_level > level:
+                conn.commit()
+                await handle_level_up(ctx.message, new_level)
+        else:
+            c.execute(
+                '''INSERT INTO users
+                   (user_id, username, xp, level, last_message, total_messages,
+                    crystal_shards, blessings_given, blessings_received)
+                   VALUES (%s, %s, 100, 1, %s, 0, 1, 0, 0)''',
+                (ctx.author.id, str(ctx.author), datetime.now().timestamp())
+            )
+
+        conn.commit()
+
+        embed = discord.Embed(
+            title="💎 CRYSTAL SHARD CLAIMED!",
+            description=f"{ctx.author.mention} has claimed the Crystal Shard!\n\n**+100 XP** ⚡\n**+1 Crystal Shard** 💎",
+            color=0x00FF00
         )
-    else:
-        c.execute(
-            '''INSERT INTO users
-               (user_id, username, xp, level, last_message, total_messages,
-                crystal_shards, blessings_given, blessings_received)
-               VALUES (?, ?, 100, 1, ?, 0, 1, 0, 0)''',
-            (ctx.author.id, str(ctx.author), datetime.now().timestamp())
-        )
-
-    conn.commit()
-    conn.close()
-
-    embed = discord.Embed(
-        title="💎 CRYSTAL SHARD CLAIMED!",
-        description=f"{ctx.author.mention} has claimed the Crystal Shard!\n\n**+100 XP** ⚡\n**+1 Crystal Shard** 💎",
-        color=0x00FF00
-    )
-    embed.set_thumbnail(url=ctx.author.display_avatar.url)
-    await ctx.send(embed=embed)
-
+        embed.set_thumbnail(url=ctx.author.display_avatar.url)
+        await ctx.send(embed=embed)
+        
+        if guild_id in crystals:
+            del crystals[guild_id]
+    
+    except Exception as e:
+        print(f"❌ Error in claim_crystal: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 async def process_xp(message):
     if message.author.bot or not message.guild:
         return
 
-    conn = sqlite3.connect('arcadia.db')
-    c = conn.cursor()
-
+    guild_id = message.guild.id
     user_id = message.author.id
     current_time = datetime.now().timestamp()
-
-    c.execute('SELECT xp, level, last_message, total_messages FROM users WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-
-    if row:
-        xp, level, last_message, total_messages = row
-
-        if last_message and current_time - last_message < XP_COOLDOWN:
-            conn.close()
+    cooldown_key = (guild_id, user_id)
+    
+    # Check in-memory cooldown first
+    if cooldown_key in xp_cooldowns:
+        if current_time - xp_cooldowns[cooldown_key] < XP_COOLDOWN:
             return
 
-        new_xp = xp + XP_PER_MESSAGE
-        new_level = get_user_level(new_xp)
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
 
-        c.execute(
-            '''UPDATE users
-               SET xp = ?, level = ?, last_message = ?, total_messages = ?, username = ?
-               WHERE user_id = ?''',
-            (new_xp, new_level, current_time, total_messages + 1, str(message.author), user_id)
-        )
+        c.execute('SELECT xp, level, last_message, total_messages FROM users WHERE user_id = %s', (user_id,))
+        row = c.fetchone()
 
-        if new_level > level:
-            await handle_level_up(message, new_level)
+        if row:
+            xp, level, last_message, total_messages = row['xp'], row['level'], row['last_message'], row['total_messages']
 
-    else:
-        c.execute(
-            '''INSERT INTO users
-               (user_id, username, xp, level, last_message, total_messages,
-                crystal_shards, blessings_given, blessings_received)
-               VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)''',
-            (user_id, str(message.author), XP_PER_MESSAGE, 1, current_time, 1)
-        )
+            if last_message and current_time - last_message < XP_COOLDOWN:
+                xp_cooldowns[cooldown_key] = last_message
+                return
 
-    conn.commit()
-    conn.close()
+            new_xp = xp + XP_PER_MESSAGE
+            new_level = get_user_level(new_xp)
+
+            c.execute(
+                '''UPDATE users
+                   SET xp = %s, level = %s, last_message = %s, total_messages = %s, username = %s
+                   WHERE user_id = %s''',
+                (new_xp, new_level, current_time, total_messages + 1, str(message.author), user_id)
+            )
+
+            conn.commit()
+            
+            xp_cooldowns[cooldown_key] = current_time
+
+            if new_level > level:
+                await handle_level_up(message, new_level)
+
+        else:
+            c.execute(
+                '''INSERT INTO users
+                   (user_id, username, xp, level, last_message, total_messages,
+                    crystal_shards, blessings_given, blessings_received)
+                   VALUES (%s, %s, %s, %s, %s, %s, 0, 0, 0)''',
+                (user_id, str(message.author), XP_PER_MESSAGE, 1, current_time, 1)
+            )
+
+            conn.commit()
+            
+            xp_cooldowns[cooldown_key] = current_time
+    
+    except Exception as e:
+        print(f"❌ Error in process_xp: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 async def handle_level_up(message, new_level):
     blessing_emoji = "✨"
@@ -331,14 +436,18 @@ async def handle_level_up(message, new_level):
         
         if role:
             try:
-                await message.author.add_roles(role)
-                embed.add_field(
-                    name="🏆 New Title Bestowed!",
-                    value=f"You have earned the rank of **{role_name}**!",
-                    inline=False
-                )
-            except:
-                pass
+                bot_member = message.guild.get_member(bot.user.id)
+                if role < bot_member.top_role:
+                    await message.author.add_roles(role)
+                    embed.add_field(
+                        name="🏆 New Title Bestowed!",
+                        value=f"You have earned the rank of **{role_name}**!",
+                        inline=False
+                    )
+                else:
+                    print(f"⚠️ Cannot assign role {role_name} - role hierarchy issue")
+            except Exception as e:
+                print(f"❌ Error assigning role: {e}")
     
     xp_needed = calculate_xp_for_level(new_level + 1) - calculate_xp_for_level(new_level)
     embed.set_footer(text=f"Next rank in {xp_needed} XP • {blessing_emoji} Blessing received")
@@ -349,56 +458,64 @@ async def handle_level_up(message, new_level):
 async def profile(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
     
-    conn = sqlite3.connect('arcadia.db')
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE user_id = ?', (target.id,))
-    user_data = c.fetchone()
-    conn.close()
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT * FROM users WHERE user_id = %s', (target.id,))
+        user_data = c.fetchone()
+        
+        if not user_data:
+            embed = discord.Embed(
+                title="📜 Guardian Profile",
+                description=f"{target.mention} has not yet begun their journey in Arcadia...",
+                color=0x808080
+            )
+        else:
+            xp = user_data['xp']
+            level = user_data['level']
+            messages = user_data['total_messages']
+            crystal_shards = user_data['crystal_shards'] if user_data['crystal_shards'] is not None else 0
+            blessings_given = user_data['blessings_given'] if user_data['blessings_given'] is not None else 0
+            blessings_received = user_data['blessings_received'] if user_data['blessings_received'] is not None else 0
+            
+            current_level_xp = calculate_xp_for_level(level)
+            next_level_xp = calculate_xp_for_level(level + 1)
+            xp_progress = xp - current_level_xp
+            xp_needed = next_level_xp - current_level_xp
+            progress_bar = create_progress_bar(xp_progress, xp_needed)
+            
+            embed = discord.Embed(
+                title=f"⚔️ {target.display_name}'s Guardian Profile",
+                color=0x00CED1
+            )
+            embed.set_thumbnail(url=target.avatar.url if target.avatar else target.default_avatar.url)
+            embed.add_field(name="📊 Level", value=f"**{level}**", inline=True)
+            embed.add_field(name="✨ Total XP", value=f"**{xp:,}**", inline=True)
+            embed.add_field(name="💬 Messages", value=f"**{messages:,}**", inline=True)
+            embed.add_field(
+                name="📈 Progress to Next Level",
+                value=f"{progress_bar}\n`{xp_progress}/{xp_needed} XP`",
+                inline=False
+            )
+            
+            embed.add_field(name="💎 Crystal Shards", value=f"**{crystal_shards}**", inline=True)
+            embed.add_field(name="🙏 Blessings Given", value=f"**{blessings_given}**", inline=True)
+            embed.add_field(name="✨ Blessings Received", value=f"**{blessings_received}**", inline=True)
+            
+            roles = [r for r in target.roles if r.name != "@everyone"]
+            if roles:
+                highest_role = max(roles, key=lambda r: r.position)
+                embed.add_field(name="🎖️ Highest Rank", value=highest_role.mention, inline=False)
+        
+        await interaction.response.send_message(embed=embed)
     
-    if not user_data:
-        embed = discord.Embed(
-            title="📜 Guardian Profile",
-            description=f"{target.mention} has not yet begun their journey in Arcadia...",
-            color=0x808080
-        )
-    else:
-        xp = user_data[2]
-        level = user_data[3]
-        messages = user_data[5]
-        crystal_shards = user_data[6] if len(user_data) > 6 else 0
-        blessings_given = user_data[7] if len(user_data) > 7 else 0
-        blessings_received = user_data[8] if len(user_data) > 8 else 0
-        
-        current_level_xp = calculate_xp_for_level(level)
-        next_level_xp = calculate_xp_for_level(level + 1)
-        xp_progress = xp - current_level_xp
-        xp_needed = next_level_xp - current_level_xp
-        progress_bar = create_progress_bar(xp_progress, xp_needed)
-        
-        embed = discord.Embed(
-            title=f"⚔️ {target.display_name}'s Guardian Profile",
-            color=0x00CED1
-        )
-        embed.set_thumbnail(url=target.avatar.url if target.avatar else target.default_avatar.url)
-        embed.add_field(name="📊 Level", value=f"**{level}**", inline=True)
-        embed.add_field(name="✨ Total XP", value=f"**{xp:,}**", inline=True)
-        embed.add_field(name="💬 Messages", value=f"**{messages:,}**", inline=True)
-        embed.add_field(
-            name="📈 Progress to Next Level",
-            value=f"{progress_bar}\n`{xp_progress}/{xp_needed} XP`",
-            inline=False
-        )
-        
-        embed.add_field(name="💎 Crystal Shards", value=f"**{crystal_shards}**", inline=True)
-        embed.add_field(name="🙏 Blessings Given", value=f"**{blessings_given}**", inline=True)
-        embed.add_field(name="✨ Blessings Received", value=f"**{blessings_received}**", inline=True)
-        
-        roles = [r for r in target.roles if r.name != "@everyone"]
-        if roles:
-            highest_role = max(roles, key=lambda r: r.position)
-            embed.add_field(name="🎖️ Highest Rank", value=highest_role.mention, inline=False)
-    
-    await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        print(f"❌ Error in profile: {e}")
+        await interaction.response.send_message("⚠️ An error occurred while fetching the profile.", ephemeral=True)
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def create_progress_bar(current, total, length=10):
     if total <= 0:
@@ -407,6 +524,8 @@ def create_progress_bar(current, total, length=10):
     filled = min(filled, length)
     return "[" + "█" * filled + "░" * (length - filled) + "]"
 
+bless_cooldowns = {}  # user_id -> timestamp
+BLESS_COOLDOWN = 300  # 5 minutes
 
 @bot.tree.command(name="bless", description="Bestow a Guardian's Blessing upon another member")
 async def bless(interaction: discord.Interaction, member: discord.Member):
@@ -418,34 +537,58 @@ async def bless(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message("Bots are beyond the reach of mortal blessings!", ephemeral=True)
         return
     
-    conn = sqlite3.connect('arcadia.db')
-    c = conn.cursor()
+    current_time = datetime.now().timestamp()
+    if interaction.user.id in bless_cooldowns:
+        time_left = BLESS_COOLDOWN - (current_time - bless_cooldowns[interaction.user.id])
+        if time_left > 0:
+            minutes = int(time_left // 60)
+            seconds = int(time_left % 60)
+            await interaction.response.send_message(
+                f"⏳ Your blessing power is recharging! Please wait {minutes}m {seconds}s before blessing again.",
+                ephemeral=True
+            )
+            return
     
+    conn = None
     try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
         blessing_xp = 25
         
-        c.execute('SELECT * FROM users WHERE user_id = ?', (interaction.user.id,))
+        c.execute('SELECT * FROM users WHERE user_id = %s', (interaction.user.id,))
         giver_data = c.fetchone()
         if giver_data:
-            c.execute('UPDATE users SET xp = ?, blessings_given = ? WHERE user_id = ?',
-                      (giver_data[2] + blessing_xp, giver_data[7] + 1, interaction.user.id))
+            new_xp = giver_data['xp'] + blessing_xp
+            new_level = get_user_level(new_xp)
+            c.execute('UPDATE users SET xp = %s, level = %s, blessings_given = %s WHERE user_id = %s',
+                      (new_xp, new_level, giver_data['blessings_given'] + 1, interaction.user.id))
+            
+            if new_level > giver_data['level']:
+                await interaction.channel.send(f"🎉 {interaction.user.mention} has ascended to **Level {new_level}** through their generosity!")
         else:
             c.execute('''INSERT INTO users (user_id, username, xp, level, last_message, total_messages, crystal_shards, blessings_given, blessings_received)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                       (interaction.user.id, str(interaction.user), blessing_xp, 1, datetime.now().timestamp(), 0, 0, 1, 0))
         
-        c.execute('SELECT * FROM users WHERE user_id = ?', (member.id,))
+        c.execute('SELECT * FROM users WHERE user_id = %s', (member.id,))
         receiver_data = c.fetchone()
         if receiver_data:
-            c.execute('UPDATE users SET xp = ?, blessings_received = ? WHERE user_id = ?',
-                      (receiver_data[2] + blessing_xp, receiver_data[8] + 1, member.id))
+            new_xp = receiver_data['xp'] + blessing_xp
+            new_level = get_user_level(new_xp)
+            c.execute('UPDATE users SET xp = %s, level = %s, blessings_received = %s WHERE user_id = %s',
+                      (new_xp, new_level, receiver_data['blessings_received'] + 1, member.id))
+            
+            if new_level > receiver_data['level']:
+                await interaction.channel.send(f"🎉 {member.mention} has ascended to **Level {new_level}** through the blessing!")
         else:
             c.execute('''INSERT INTO users (user_id, username, xp, level, last_message, total_messages, crystal_shards, blessings_given, blessings_received)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                       (member.id, str(member), blessing_xp, 1, datetime.now().timestamp(), 0, 0, 0, 1))
         
         conn.commit()
-        conn.close()
+        
+        bless_cooldowns[interaction.user.id] = current_time
         
         embed = discord.Embed(
             title="✨ GUARDIAN'S BLESSING BESTOWED ✨",
@@ -458,47 +601,59 @@ async def bless(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message(embed=embed)
     
     except discord.Forbidden:
-        conn.close()
         await interaction.response.send_message(
             "⚠️ I lack the permissions to bestow this blessing! Please ensure I have 'Manage Roles' permission.",
             ephemeral=True
         )
     except Exception as e:
-        conn.close()
+        print(f"❌ Error in bless: {e}")
+        if conn:
+            conn.rollback()
         await interaction.response.send_message(
-            f"⚠️ An error occurred while bestowing the blessing: {str(e)}",
+            f"⚠️ An error occurred while bestowing the blessing.",
             ephemeral=True
         )
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 @bot.tree.command(name="leaderboard", description="View the top Guardians of Arcadia")
 async def leaderboard(interaction: discord.Interaction):
-    conn = sqlite3.connect('arcadia.db')
-    c = conn.cursor()
-    c.execute('SELECT user_id, username, xp, level FROM users ORDER BY xp DESC LIMIT 10')
-    top_users = c.fetchall()
-    conn.close()
-    
-    if not top_users:
-        await interaction.response.send_message("The leaderboard is empty! Begin your journey to claim glory!")
-        return
-    
-    embed = discord.Embed(
-        title="🏆 HALL OF LEGENDS 🏆",
-        description="*The most valiant Guardians of Arcadia*",
-        color=0xFFD700
-    )
-    
-    medals = ["🥇", "🥈", "🥉"]
-    
-    for idx, (user_id, username, xp, level) in enumerate(top_users, 1):
-        medal = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
-        embed.add_field(
-            name=f"{medal} {username}",
-            value=f"Level {level} • {xp:,} XP",
-            inline=False
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT user_id, username, xp, level FROM users ORDER BY xp DESC LIMIT 10')
+        top_users = c.fetchall()
+        
+        if not top_users:
+            await interaction.response.send_message("The leaderboard is empty! Begin your journey to claim glory!")
+            return
+        
+        embed = discord.Embed(
+            title="🏆 HALL OF LEGENDS 🏆",
+            description="*The most valiant Guardians of Arcadia*",
+            color=0xFFD700
         )
+        
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for idx, user in enumerate(top_users, 1):
+            medal = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+            embed.add_field(
+                name=f"{medal} {user['username']}",
+                value=f"Level {user['level']} • {user['xp']:,} XP",
+                inline=False
+            )
+        
+        await interaction.response.send_message(embed=embed)
     
-    await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        print(f"❌ Error in leaderboard: {e}")
+        await interaction.response.send_message("⚠️ An error occurred while fetching the leaderboard.", ephemeral=True)
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 @bot.tree.command(name="prophecy", description="Receive a mystical prophecy from the Arcane")
 async def prophecy(interaction: discord.Interaction):
@@ -587,7 +742,7 @@ async def rank(interaction: discord.Interaction):
         xp_needed = calculate_xp_for_level(level)
         embed.add_field(
             name=f"Level {level} - {role_name}",
-            value=f"Requires: {xp_needed:,} XP",
+            value=f"Total XP to reach: {xp_needed:,}",
             inline=True
         )
     
@@ -687,24 +842,29 @@ async def db_check(interaction: discord.Interaction):
         await interaction.response.send_message("Only the server owner can check the database!", ephemeral=True)
         return
     
+    conn = None
     try:
-        conn = sqlite3.connect('arcadia.db')
+        conn = get_db_connection()
         c = conn.cursor()
         
-        c.execute("PRAGMA table_info(users)")
+        c.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'users'
+            ORDER BY ordinal_position
+        """)
         columns = c.fetchall()
-        column_names = [col[1] for col in columns]
+        column_names = [col['column_name'] for col in columns]
         
-        c.execute("SELECT COUNT(*) FROM users")
-        user_count = c.fetchone()[0]
-        
-        conn.close()
+        c.execute("SELECT COUNT(*) as count FROM users")
+        user_count = c.fetchone()['count']
         
         embed = discord.Embed(
             title="🔍 Database Health Check",
             color=0x00FF00
         )
         embed.add_field(name="Total Users", value=str(user_count), inline=True)
+        embed.add_field(name="Database Type", value="PostgreSQL (Neon)", inline=True)
         embed.add_field(name="Columns", value=", ".join(column_names), inline=False)
         embed.set_footer(text="Database is operational ✅")
         
@@ -712,14 +872,22 @@ async def db_check(interaction: discord.Interaction):
     
     except Exception as e:
         await interaction.response.send_message(f"❌ Database error: {str(e)}", ephemeral=True)
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 if __name__ == "__main__":
     TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    
     if not TOKEN:
         print("❌ Error: DISCORD_BOT_TOKEN not found in environment variables!")
         print("Please set your bot token in the environment or .env file")
+    elif not DATABASE_URL:
+        print("❌ Error: DATABASE_URL not found in environment variables!")
+        print("Please set your Neon database connection string in the environment or .env file")
     else:
         print("🌐 Starting keep-alive server for Render...")
         keep_alive()
-        print("🤖 Starting Discord bot...")
+        print("🤖 Starting Discord bot with PostgreSQL database...")
         bot.run(TOKEN)
