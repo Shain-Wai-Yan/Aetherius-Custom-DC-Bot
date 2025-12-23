@@ -5,7 +5,7 @@ import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 import asyncio
-from datetime import datetime
+from datetime import datetime, date
 import random
 from dotenv import load_dotenv
 from flask import Flask
@@ -38,6 +38,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.presences = True
+intents.voice_states = True  # Added for voice chat tracking
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -102,6 +103,34 @@ def init_db():
             c.execute('ALTER TABLE users ADD COLUMN blessings_received INTEGER DEFAULT 0')
             print("✅ Added blessings_received column to existing database")
         
+        c.execute('''CREATE TABLE IF NOT EXISTS user_quests
+                     (quest_id SERIAL PRIMARY KEY,
+                      user_id BIGINT NOT NULL,
+                      quest_name TEXT NOT NULL,
+                      quest_type TEXT NOT NULL,
+                      quest_description TEXT,
+                      quest_reward INTEGER,
+                      progress INTEGER DEFAULT 0,
+                      target INTEGER,
+                      completed BOOLEAN DEFAULT FALSE,
+                      claimed BOOLEAN DEFAULT FALSE,
+                      assigned_date DATE NOT NULL,
+                      completed_date TIMESTAMP,
+                      UNIQUE(user_id, assigned_date))''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS quest_progress
+                     (id SERIAL PRIMARY KEY,
+                      user_id BIGINT NOT NULL,
+                      quest_date DATE NOT NULL,
+                      messages_sent INTEGER DEFAULT 0,
+                      unique_channels TEXT[] DEFAULT '{}',
+                      commands_used TEXT[] DEFAULT '{}',
+                      reactions_added INTEGER DEFAULT 0,
+                      voice_time INTEGER DEFAULT 0,
+                      help_given BOOLEAN DEFAULT FALSE,
+                      late_night_active BOOLEAN DEFAULT FALSE,
+                      UNIQUE(user_id, quest_date))''')
+        
         c.execute('''CREATE TABLE IF NOT EXISTS prophecies
                      (date TEXT PRIMARY KEY,
                       prophecy TEXT,
@@ -109,6 +138,7 @@ def init_db():
         
         conn.commit()
         print("✅ Database tables initialized successfully!")
+        print("✅ Quest system tables created!")
     except Exception as e:
         print(f"❌ Database initialization error: {e}")
         if conn:
@@ -117,22 +147,22 @@ def init_db():
         if conn:
             release_db_connection(conn)
 
+
 XP_PER_MESSAGE = 15
-XP_COOLDOWN = 60  # seconds between XP gains
+XP_COOLDOWN = 60
 LEVEL_MULTIPLIER = 100
 
 message_counter = defaultdict(int)
-crystals = {}  # guild_id -> {active: bool, message_id: int, channel_id: int}
+crystals = {}
 crystal_lock = Lock()
-xp_cooldowns = {}  # (guild_id, user_id) -> timestamp
+xp_cooldowns = {}
 
-CRYSTAL_DROP_CHANCE = 50  # Every ~50 messages a crystal can drop
-# crystal_active = False # REMOVED
-# crystal_message_id = None # REMOVED
-# crystal_lock = Lock() # MOVED UP
+CRYSTAL_DROP_CHANCE = 50
 
 keyword_cooldowns = defaultdict(float)
-KEYWORD_COOLDOWN = 30  # seconds between keyword responses per user
+KEYWORD_COOLDOWN = 30
+
+voice_tracking = {}  # user_id -> {join_time: timestamp}
 
 ROLE_REWARDS = {
     0: "Cloud-Walker",
@@ -157,8 +187,52 @@ LEVEL_BLESSINGS = {
     50: "🌟"
 }
 
+QUEST_TYPES = {
+    "social_butterfly": {
+        "name": "Social Butterfly",
+        "description": "Send 20 messages in different channels",
+        "reward": 300,
+        "target": 20,
+        "type": "messages"
+    },
+    "guardians_wisdom": {
+        "name": "Guardian's Wisdom",
+        "description": "Share lore or help a new member (use /lore or mention @new)",
+        "reward": 250,
+        "target": 1,
+        "type": "help"
+    },
+    "arcane_explorer": {
+        "name": "Arcane Explorer",
+        "description": "Use 5 different bot commands",
+        "reward": 200,
+        "target": 5,
+        "type": "commands"
+    },
+    "voice_of_arcadia": {
+        "name": "Voice of Arcadia",
+        "description": "Spend 30 minutes in voice chat",
+        "reward": 350,
+        "target": 1800,  # 30 minutes in seconds
+        "type": "voice"
+    },
+    "reaction_master": {
+        "name": "Reaction Master",
+        "description": "React to 15 messages with emojis",
+        "reward": 150,
+        "target": 15,
+        "type": "reactions"
+    },
+    "night_watch": {
+        "name": "Night Watch",
+        "description": "Be active during late hours (after 10 PM server time)",
+        "reward": 400,
+        "target": 1,
+        "type": "late_night"
+    }
+}
+
 def calculate_xp_for_level(level):
-    # Total XP required to REACH this level
     return LEVEL_MULTIPLIER * (level - 1) ** 2
 
 def get_user_level(xp):
@@ -166,6 +240,203 @@ def get_user_level(xp):
     while xp >= calculate_xp_for_level(level + 1):
         level += 1
     return level
+
+async def get_or_assign_daily_quest(user_id):
+    """Get today's quest for user, or assign a new one if none exists"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        today = date.today()
+        
+        # Check if user has a quest for today
+        c.execute('''SELECT * FROM user_quests 
+                     WHERE user_id = %s AND assigned_date = %s''',
+                  (user_id, today))
+        quest = c.fetchone()
+        
+        if quest:
+            return dict(quest)
+        
+        # Assign a new random quest
+        quest_key = random.choice(list(QUEST_TYPES.keys()))
+        quest_data = QUEST_TYPES[quest_key]
+        
+        c.execute('''INSERT INTO user_quests 
+                     (user_id, quest_name, quest_type, quest_description, 
+                      quest_reward, target, assigned_date)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s)
+                     RETURNING *''',
+                  (user_id, quest_data['name'], quest_data['type'],
+                   quest_data['description'], quest_data['reward'],
+                   quest_data['target'], today))
+        
+        new_quest = c.fetchone()
+        conn.commit()
+        
+        # Initialize progress tracking
+        c.execute('''INSERT INTO quest_progress (user_id, quest_date)
+                     VALUES (%s, %s)
+                     ON CONFLICT (user_id, quest_date) DO NOTHING''',
+                  (user_id, today))
+        conn.commit()
+        
+        return dict(new_quest)
+    
+    except Exception as e:
+        print(f"❌ Error in get_or_assign_daily_quest: {e}")
+        if conn:
+            conn.rollback()
+        return None
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+async def update_quest_progress(user_id, progress_type, value=1, channel_id=None):
+    """Update user's quest progress based on activity"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        today = date.today()
+        
+        # Get user's active quest
+        c.execute('''SELECT * FROM user_quests 
+                     WHERE user_id = %s AND assigned_date = %s 
+                     AND completed = FALSE''',
+                  (user_id, today))
+        quest = c.fetchone()
+        
+        if not quest:
+            return False
+        
+        quest_type = quest['quest_type']
+        
+        # Update progress based on quest type
+        if quest_type == 'messages' and progress_type == 'message':
+            # Track unique channels for Social Butterfly
+            c.execute('''SELECT unique_channels FROM quest_progress
+                         WHERE user_id = %s AND quest_date = %s''',
+                      (user_id, today))
+            progress = c.fetchone()
+            
+            if progress:
+                channels = progress['unique_channels'] or []
+                if channel_id and str(channel_id) not in channels:
+                    channels.append(str(channel_id))
+                    c.execute('''UPDATE quest_progress
+                                 SET unique_channels = %s, messages_sent = %s
+                                 WHERE user_id = %s AND quest_date = %s''',
+                              (channels, len(channels), user_id, today))
+                    
+                    # Update quest progress
+                    new_progress = len(channels)
+                    c.execute('''UPDATE user_quests
+                                 SET progress = %s, 
+                                     completed = CASE WHEN %s >= target THEN TRUE ELSE FALSE END
+                                 WHERE user_id = %s AND assigned_date = %s''',
+                              (new_progress, new_progress, user_id, today))
+        
+        elif quest_type == 'commands' and progress_type == 'command':
+            # Track unique commands for Arcane Explorer
+            c.execute('''SELECT commands_used FROM quest_progress
+                         WHERE user_id = %s AND quest_date = %s''',
+                      (user_id, today))
+            progress = c.fetchone()
+            
+            if progress:
+                commands = progress['commands_used'] or []
+                if value not in commands:
+                    commands.append(value)
+                    c.execute('''UPDATE quest_progress
+                                 SET commands_used = %s
+                                 WHERE user_id = %s AND quest_date = %s''',
+                              (commands, user_id, today))
+                    
+                    new_progress = len(commands)
+                    c.execute('''UPDATE user_quests
+                                 SET progress = %s,
+                                     completed = CASE WHEN %s >= target THEN TRUE ELSE FALSE END
+                                 WHERE user_id = %s AND assigned_date = %s''',
+                              (new_progress, new_progress, user_id, today))
+        
+        elif quest_type == 'reactions' and progress_type == 'reaction':
+            # Track reactions for Reaction Master
+            c.execute('''UPDATE quest_progress
+                         SET reactions_added = reactions_added + 1
+                         WHERE user_id = %s AND quest_date = %s''',
+                      (user_id, today))
+            
+            c.execute('''UPDATE user_quests
+                         SET progress = progress + 1,
+                             completed = CASE WHEN progress + 1 >= target THEN TRUE ELSE FALSE END
+                         WHERE user_id = %s AND assigned_date = %s''',
+                      (user_id, today))
+        
+        elif quest_type == 'voice' and progress_type == 'voice':
+            # Track voice time for Voice of Arcadia
+            c.execute('''UPDATE quest_progress
+                         SET voice_time = voice_time + %s
+                         WHERE user_id = %s AND quest_date = %s''',
+                      (value, user_id, today))
+            
+            c.execute('''SELECT voice_time FROM quest_progress
+                         WHERE user_id = %s AND quest_date = %s''',
+                      (user_id, today))
+            progress = c.fetchone()
+            
+            if progress:
+                total_time = progress['voice_time']
+                c.execute('''UPDATE user_quests
+                             SET progress = %s,
+                                 completed = CASE WHEN %s >= target THEN TRUE ELSE FALSE END
+                             WHERE user_id = %s AND assigned_date = %s''',
+                          (total_time, total_time, user_id, today))
+        
+        elif quest_type == 'help' and progress_type == 'help':
+            # Track help given for Guardian's Wisdom
+            c.execute('''UPDATE quest_progress
+                         SET help_given = TRUE
+                         WHERE user_id = %s AND quest_date = %s''',
+                      (user_id, today))
+            
+            c.execute('''UPDATE user_quests
+                         SET progress = 1, completed = TRUE
+                         WHERE user_id = %s AND assigned_date = %s''',
+                      (user_id, today))
+        
+        elif quest_type == 'late_night' and progress_type == 'late_night':
+            # Track late night activity for Night Watch
+            c.execute('''UPDATE quest_progress
+                         SET late_night_active = TRUE
+                         WHERE user_id = %s AND quest_date = %s''',
+                      (user_id, today))
+            
+            c.execute('''UPDATE user_quests
+                         SET progress = 1, completed = TRUE
+                         WHERE user_id = %s AND assigned_date = %s''',
+                      (user_id, today))
+        
+        conn.commit()
+        
+        # Check if quest just completed
+        c.execute('''SELECT * FROM user_quests 
+                     WHERE user_id = %s AND assigned_date = %s''',
+                  (user_id, today))
+        updated_quest = c.fetchone()
+        
+        return updated_quest['completed'] if updated_quest else False
+        
+    except Exception as e:
+        print(f"❌ Error in update_quest_progress: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 @bot.event
 async def on_ready():
@@ -216,6 +487,38 @@ async def on_member_join(member):
         await welcome_channel.send(embed=embed)
 
 @bot.event
+async def on_voice_state_update(member, before, after):
+    """Track voice channel activity for quests"""
+    if member.bot:
+        return
+    
+    # User joined a voice channel
+    if before.channel is None and after.channel is not None:
+        voice_tracking[member.id] = {
+            'join_time': datetime.now().timestamp()
+        }
+    
+    # User left a voice channel
+    elif before.channel is not None and after.channel is None:
+        if member.id in voice_tracking:
+            join_time = voice_tracking[member.id]['join_time']
+            current_time = datetime.now().timestamp()
+            time_spent = int(current_time - join_time)
+            
+            # Update quest progress
+            await update_quest_progress(member.id, 'voice', time_spent)
+            
+            del voice_tracking[member.id]
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    """Track reactions for quests"""
+    if user.bot:
+        return
+    
+    await update_quest_progress(user.id, 'reaction')
+
+@bot.event
 async def on_message(message):
     global message_counter, crystals
     
@@ -228,6 +531,7 @@ async def on_message(message):
     guild_id = message.guild.id
     message_counter[guild_id] += 1
     
+    # Crystal drop logic
     if message_counter[guild_id] >= CRYSTAL_DROP_CHANCE and guild_id not in crystals:
         message_counter[guild_id] = 0
         
@@ -261,6 +565,13 @@ async def on_message(message):
     
     content_lower = message.content.lower()
     
+    if 'lore' in content_lower or '@new' in content_lower or 'welcome' in content_lower:
+        await update_quest_progress(message.author.id, 'help')
+    
+    current_hour = datetime.now().hour
+    if current_hour >= 22 or current_hour < 6:  # 10 PM to 6 AM
+        await update_quest_progress(message.author.id, 'late_night')
+    
     keywords = {
         "greetings guardian": "🛡️ Greetings, brave soul! The Guardians watch over you.",
         "what is arcadia": "✨ Arcadia is a realm of floating islands, ancient magic, and eternal wonder. Where sky and stone unite, legends are born!",
@@ -281,6 +592,8 @@ async def on_message(message):
                 await message.channel.send(response)
                 keyword_cooldowns[user_id] = current_time
             break
+    
+    await update_quest_progress(message.author.id, 'message', channel_id=message.channel.id)
     
     await process_xp(message)
     
@@ -361,7 +674,6 @@ async def process_xp(message):
     current_time = datetime.now().timestamp()
     cooldown_key = (guild_id, user_id)
     
-    # Check in-memory cooldown first
     if cooldown_key in xp_cooldowns:
         if current_time - xp_cooldowns[cooldown_key] < XP_COOLDOWN:
             return
@@ -505,6 +817,23 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
             embed.add_field(name="🙏 Blessings Given", value=f"**{blessings_given}**", inline=True)
             embed.add_field(name="✨ Blessings Received", value=f"**{blessings_received}**", inline=True)
             
+            today = date.today()
+            c.execute('''SELECT * FROM user_quests 
+                         WHERE user_id = %s AND assigned_date = %s''',
+                      (target.id, today))
+            quest = c.fetchone()
+            
+            if quest:
+                progress_percent = int((quest['progress'] / quest['target']) * 100) if quest['target'] > 0 else 0
+                status = "✅ Completed!" if quest['completed'] else f"{quest['progress']}/{quest['target']}"
+                claimed_status = " (Claimed)" if quest['claimed'] else ""
+                
+                embed.add_field(
+                    name="🗺️ Today's Quest",
+                    value=f"**{quest['quest_name']}**{claimed_status}\nProgress: {status}",
+                    inline=False
+                )
+            
             roles = [r for r in target.roles if r.name != "@everyone"]
             if roles:
                 highest_role = max(roles, key=lambda r: r.position)
@@ -526,11 +855,13 @@ def create_progress_bar(current, total, length=10):
     filled = min(filled, length)
     return "[" + "█" * filled + "░" * (length - filled) + "]"
 
-bless_cooldowns = {}  # user_id -> timestamp
-BLESS_COOLDOWN = 300  # 5 minutes
+bless_cooldowns = {}
+BLESS_COOLDOWN = 300
 
 @bot.tree.command(name="bless", description="Bestow a Guardian's Blessing upon another member")
 async def bless(interaction: discord.Interaction, member: discord.Member):
+    await update_quest_progress(interaction.user.id, 'command', 'bless')
+    
     if member.id == interaction.user.id:
         await interaction.response.send_message("You cannot bless yourself, noble Guardian!", ephemeral=True)
         return
@@ -621,33 +952,40 @@ async def bless(interaction: discord.Interaction, member: discord.Member):
 
 @bot.tree.command(name="leaderboard", description="View the top Guardians of Arcadia")
 async def leaderboard(interaction: discord.Interaction):
+    await update_quest_progress(interaction.user.id, 'command', 'leaderboard')
+    
     conn = None
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute('SELECT user_id, username, xp, level FROM users ORDER BY xp DESC LIMIT 10')
+        
+        c.execute('''SELECT user_id, username, xp, level 
+                     FROM users 
+                     ORDER BY xp DESC 
+                     LIMIT 10''')
         top_users = c.fetchall()
         
         if not top_users:
-            await interaction.response.send_message("The leaderboard is empty! Begin your journey to claim glory!")
+            await interaction.response.send_message("No Guardians have begun their journey yet!", ephemeral=True)
             return
         
         embed = discord.Embed(
-            title="🏆 HALL OF LEGENDS 🏆",
-            description="*The most valiant Guardians of Arcadia*",
+            title="🏆 ARCADIA LEADERBOARD 🏆",
+            description="The mightiest Guardians of the realm!",
             color=0xFFD700
         )
         
         medals = ["🥇", "🥈", "🥉"]
         
-        for idx, user in enumerate(top_users, 1):
-            medal = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+        for idx, user in enumerate(top_users):
+            medal = medals[idx] if idx < 3 else f"**{idx + 1}.**"
             embed.add_field(
                 name=f"{medal} {user['username']}",
                 value=f"Level {user['level']} • {user['xp']:,} XP",
                 inline=False
             )
         
+        embed.set_footer(text="Keep climbing the ranks, Guardian!")
         await interaction.response.send_message(embed=embed)
     
     except Exception as e:
@@ -659,6 +997,8 @@ async def leaderboard(interaction: discord.Interaction):
 
 @bot.tree.command(name="prophecy", description="Receive a mystical prophecy from the Arcane")
 async def prophecy(interaction: discord.Interaction):
+    await update_quest_progress(interaction.user.id, 'command', 'prophecy')
+    
     prophecies = [
         ("fortune", "✨ The crystals shimmer with favor... Great fortune awaits those who dare to reach for the stars!"),
         ("challenge", "⚔️ The winds speak of trials ahead... Steel your resolve, for challenges forge legends!"),
@@ -683,6 +1023,9 @@ async def prophecy(interaction: discord.Interaction):
 
 @bot.tree.command(name="lore", description="Discover the mysteries and lore of Arcadia")
 async def lore(interaction: discord.Interaction, topic: str = None):
+    await update_quest_progress(interaction.user.id, 'command', 'lore')
+    await update_quest_progress(interaction.user.id, 'help')
+    
     lore_entries = {
         "arcadia": {
             "title": "🏰 The Realm of Arcadia",
@@ -715,25 +1058,35 @@ async def lore(interaction: discord.Interaction, topic: str = None):
         embed = discord.Embed(
             title=entry["title"],
             description=entry["content"],
-            color=0x00CED1
+            color=0x1ABC9C
         )
     else:
         embed = discord.Embed(
-            title="📖 Arcadia's Chronicles",
-            description="Choose a topic to learn more about the mysteries of our realm:",
-            color=0x00CED1
+            title="📜 Arcadia Lore",
+            description="Available topics: " + ", ".join(lore_entries.keys()),
+            color=0x1ABC9C
         )
-        for key, entry in lore_entries.items():
-            embed.add_field(
-                name=entry["title"],
-                value=f"Use `/lore {key}` to read more",
-                inline=False
-            )
     
     await interaction.response.send_message(embed=embed)
 
+# Safe shutdown for the bot
+async def shutdown():
+    print("🛡️ Shutting down Aetherius...")
+    global connection_pool
+    if connection_pool:
+        connection_pool.closeall()
+        print("✅ Connection pool closed.")
+    await bot.close()
+
+# Handle SIGINT/SIGTERM to run shutdown
+import signal
+for sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, lambda s, f: asyncio.create_task(shutdown()))
+
 @bot.tree.command(name="rank", description="View all ranks and their XP requirements")
 async def rank(interaction: discord.Interaction):
+    await update_quest_progress(interaction.user.id, 'command', 'rank')
+    
     embed = discord.Embed(
         title="🎖️ GUARDIAN RANKS & HIERARCHY",
         description="Rise through the ranks and earn your place among legends!",
@@ -752,31 +1105,186 @@ async def rank(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="quest", description="Get a daily quest to earn bonus XP")
+@bot.tree.command(name="quest", description="View your daily quest and progress")
 async def quest(interaction: discord.Interaction):
-    quests = [
-        ("Social Butterfly", "Send 20 messages in different channels", 300),
-        ("Guardian's Wisdom", "Share lore or help a new member", 250),
-        ("Arcane Explorer", "Use 5 different bot commands", 200),
-        ("Voice of Arcadia", "Spend 30 minutes in voice chat", 350),
-        ("Reaction Master", "React to 15 messages with emojis", 150),
-        ("Night Watch", "Be active during late hours (after 10 PM)", 400),
-    ]
+    """View today's quest, progress, and claim rewards"""
+    await update_quest_progress(interaction.user.id, 'command', 'quest')
     
-    quest_name, quest_desc, quest_reward = random.choice(quests)
+    conn = None
+    try:
+        # Get or assign today's quest
+        quest_data = await get_or_assign_daily_quest(interaction.user.id)
+        
+        if not quest_data:
+            await interaction.response.send_message(
+                "⚠️ Unable to retrieve your quest. Please try again!",
+                ephemeral=True
+            )
+            return
+        
+        # Create embed
+        progress_percent = int((quest_data['progress'] / quest_data['target']) * 100) if quest_data['target'] > 0 else 0
+        progress_bar = create_progress_bar(quest_data['progress'], quest_data['target'], 15)
+        
+        if quest_data['completed'] and quest_data['claimed']:
+            # Quest already completed and claimed
+            embed = discord.Embed(
+                title="✅ QUEST COMPLETED",
+                description=f"**{quest_data['quest_name']}**\n\n{quest_data['quest_description']}",
+                color=0x808080
+            )
+            embed.add_field(
+                name="Status",
+                value="You've already completed today's quest! Come back tomorrow for a new challenge.",
+                inline=False
+            )
+        elif quest_data['completed'] and not quest_data['claimed']:
+            # Quest completed but not claimed
+            embed = discord.Embed(
+                title="🎉 QUEST COMPLETED!",
+                description=f"**{quest_data['quest_name']}**\n\n{quest_data['quest_description']}",
+                color=0x00FF00
+            )
+            embed.add_field(name="💰 Reward", value=f"+{quest_data['quest_reward']} XP", inline=False)
+            embed.add_field(
+                name="✨ Claim Your Reward",
+                value="Use `/questclaim` to collect your reward!",
+                inline=False
+            )
+        else:
+            # Quest in progress
+            embed = discord.Embed(
+                title="🗺️ DAILY QUEST",
+                description=f"**{quest_data['quest_name']}**\n\n{quest_data['quest_description']}",
+                color=0x00CED1
+            )
+            embed.add_field(name="💰 Reward", value=f"+{quest_data['quest_reward']} XP", inline=True)
+            embed.add_field(name="📊 Progress", value=f"{quest_data['progress']}/{quest_data['target']}", inline=True)
+            embed.add_field(
+                name="Progress Bar",
+                value=f"{progress_bar} {progress_percent}%",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Quest resets daily at midnight • {quest_data['assigned_date']}")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
     
-    embed = discord.Embed(
-        title="🗺️ DAILY QUEST",
-        description=f"**{quest_name}**\n\n{quest_desc}",
-        color=0x00FF00
-    )
-    embed.add_field(name="💰 Reward", value=f"+{quest_reward} XP", inline=False)
-    embed.set_footer(text="Complete this quest before the day ends!")
+    except Exception as e:
+        print(f"❌ Error in quest command: {e}")
+        await interaction.response.send_message(
+            "⚠️ An error occurred while retrieving your quest.",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="questclaim", description="Claim your completed quest reward")
+async def questclaim(interaction: discord.Interaction):
+    """Claim XP reward for completed quest"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        today = date.today()
+        
+        # Get user's quest
+        c.execute('''SELECT * FROM user_quests 
+                     WHERE user_id = %s AND assigned_date = %s''',
+                  (interaction.user.id, today))
+        quest = c.fetchone()
+        
+        if not quest:
+            await interaction.response.send_message(
+                "⚠️ You don't have an active quest today! Use `/quest` to get one.",
+                ephemeral=True
+            )
+            return
+        
+        if not quest['completed']:
+            await interaction.response.send_message(
+                f"⚠️ You haven't completed your quest yet!\n\n**Progress:** {quest['progress']}/{quest['target']}",
+                ephemeral=True
+            )
+            return
+        
+        if quest['claimed']:
+            await interaction.response.send_message(
+                "⚠️ You've already claimed this quest reward!",
+                ephemeral=True
+            )
+            return
+        
+        # Ensure user exists in database before awarding XP
+        c.execute('SELECT xp, level FROM users WHERE user_id = %s', (interaction.user.id,))
+        user = c.fetchone()
+        
+        if not user:
+            # Create user if doesn't exist
+            c.execute('''INSERT INTO users (user_id, username, xp, level)
+                         VALUES (%s, %s, 0, 1)''',
+                      (interaction.user.id, interaction.user.name))
+            conn.commit()
+            user = {'xp': 0, 'level': 1}
+        
+        old_xp = user['xp']
+        old_level = user['level']
+        new_xp = old_xp + quest['quest_reward']
+        new_level = get_user_level(new_xp)
+        
+        c.execute('''UPDATE users 
+                     SET xp = %s, level = %s 
+                     WHERE user_id = %s''',
+                  (new_xp, new_level, interaction.user.id))
+        
+        c.execute('''UPDATE user_quests 
+                     SET claimed = TRUE, completed_date = %s 
+                     WHERE user_id = %s AND assigned_date = %s''',
+                  (datetime.now(), interaction.user.id, today))
+        
+        conn.commit()
+        
+        embed = discord.Embed(
+            title="✨ QUEST REWARD CLAIMED!",
+            description=f"**{quest['quest_name']}** completed!\n\nYou've earned **+{quest['quest_reward']} XP**!",
+            color=0xFFD700
+        )
+        embed.add_field(name="Previous XP", value=f"{old_xp:,}", inline=True)
+        embed.add_field(name="New XP", value=f"{new_xp:,}", inline=True)
+        embed.add_field(name="Current Level", value=f"Level {new_level}", inline=True)
+        
+        if new_level > old_level:
+            level_up_text = f"\n\n🎉 **LEVEL UP!** You've reached Level {new_level}!"
+            if new_level in ROLE_REWARDS:
+                level_up_text += f"\n⚔️ New Rank: **{ROLE_REWARDS[new_level]}**"
+            embed.add_field(name="Milestone Achieved!", value=level_up_text, inline=False)
+        
+        embed.set_footer(text="Return tomorrow for a new quest!")
+        
+        await interaction.response.send_message(embed=embed)
+        
+        if new_level > old_level:
+            level_blessing = LEVEL_BLESSINGS.get(new_level, "⭐")
+            announcement = f"{level_blessing} {interaction.user.mention} has ascended to **Level {new_level}** by completing their quest!"
+            if new_level in ROLE_REWARDS:
+                announcement += f"\n⚔️ New Rank Unlocked: **{ROLE_REWARDS[new_level]}**"
+            await interaction.channel.send(announcement)
     
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"❌ Error in questclaim: {e}")
+        if conn:
+            conn.rollback()
+        await interaction.response.send_message(
+            "⚠️ An error occurred while claiming your reward. Please try again!",
+            ephemeral=True
+        )
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 @bot.tree.command(name="arcadia", description="Get information about the Guardian of Arcadia server")
 async def arcadia(interaction: discord.Interaction):
+    await update_quest_progress(interaction.user.id, 'command', 'arcadia')
+    
     embed = discord.Embed(
         title="🏰 Welcome to Guardian of Arcadia",
         description="A mystical realm where legends are born among the floating isles!",
@@ -794,12 +1302,12 @@ async def arcadia(interaction: discord.Interaction):
     )
     embed.add_field(
         name="📜 Available Commands",
-        value="`/profile` `/leaderboard` `/prophecy` `/lore` `/rank` `/quest` `/bless`",
+        value="`/profile` `/leaderboard` `/prophecy` `/lore` `/rank` `/quest` `/questclaim` `/bless`",
         inline=False
     )
     embed.add_field(
         name="💎 Special Features",
-        value="• Crystal Shard drops (type `!claim` when they appear)\n• Guardian's Blessing system (`/bless @user`)\n• Keyword responses in chat",
+        value="• Daily Quest system with tracking\n• Crystal Shard drops (type `!claim` when they appear)\n• Guardian's Blessing system (`/bless @user`)\n• Keyword responses in chat",
         inline=False
     )
     
@@ -807,6 +1315,8 @@ async def arcadia(interaction: discord.Interaction):
 
 @bot.tree.command(name="ranks", description="View all available ranks and their requirements")
 async def ranks(interaction: discord.Interaction):
+    await update_quest_progress(interaction.user.id, 'command', 'ranks')
+    
     embed = discord.Embed(
         title="⚔️ GUARDIAN RANK HIERARCHY ⚔️",
         description="*Ascend through the ranks to unlock greater power*",
@@ -839,9 +1349,9 @@ async def sync_commands(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Failed to sync: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="dbcheck", description="[Admin] Check database health")
-async def db_check(interaction: discord.Interaction):
+async def dbcheck(interaction: discord.Interaction):
     if interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message("Only the server owner can check the database!", ephemeral=True)
+        await interaction.response.send_message("Only the server owner can check database health!", ephemeral=True)
         return
     
     conn = None
@@ -849,26 +1359,23 @@ async def db_check(interaction: discord.Interaction):
         conn = get_db_connection()
         c = conn.cursor()
         
-        c.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'users'
-            ORDER BY ordinal_position
-        """)
-        columns = c.fetchall()
-        column_names = [col['column_name'] for col in columns]
-        
-        c.execute("SELECT COUNT(*) as count FROM users")
+        c.execute('SELECT COUNT(*) as count FROM users')
         user_count = c.fetchone()['count']
         
+        c.execute('SELECT COUNT(*) as count FROM user_quests')
+        quest_count = c.fetchone()['count']
+        
+        c.execute('SELECT COUNT(*) as count FROM quest_progress')
+        progress_count = c.fetchone()['count']
+        
         embed = discord.Embed(
-            title="🔍 Database Health Check",
+            title="💾 Database Health Check",
             color=0x00FF00
         )
         embed.add_field(name="Total Users", value=str(user_count), inline=True)
-        embed.add_field(name="Database Type", value="PostgreSQL (Neon)", inline=True)
-        embed.add_field(name="Columns", value=", ".join(column_names), inline=False)
-        embed.set_footer(text="Database is operational ✅")
+        embed.add_field(name="Total Quests", value=str(quest_count), inline=True)
+        embed.add_field(name="Progress Records", value=str(progress_count), inline=True)
+        embed.add_field(name="Status", value="✅ All systems operational", inline=False)
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
     
